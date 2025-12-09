@@ -5,6 +5,8 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from torchvision.transforms import v2
+
 import os
 
 import matplotlib.pyplot as plt
@@ -20,15 +22,44 @@ def get_medmnist_transforms(size: int = 224, augment: bool = False) -> transform
         # SSL augmentations for SimCLR/VICReg pretraining
         return transforms.Compose([
             transforms.Resize((size, size)),
-            transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
             transforms.ToTensor(),
-            transforms.Normalize(MEDMNIST_MEAN, MEDMNIST_STD)
+            transforms.Normalize(MEDMNIST_MEAN, MEDMNIST_STD),
+
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+
+            v2.RandomResizedCrop(
+                size=(224, 224),
+                scale=(0.5, 1.0),
+                ratio=(0.8, 1.2),
+                antialias=True
+            ),
+            v2.RandomHorizontalFlip(p=0.5),  # for Pretraining OK
+            v2.RandomAffine(
+                degrees=12,
+                translate=(0.1, 0.1),
+                scale=(0.95, 1.05)
+            ),
+
+            v2.RandomApply([
+                v2.GaussianNoise(mean=0.0, sigma=0.05)
+            ], p=0.2),
+
+            v2.Lambda(lambda x: x.clamp(0.0, 1.0)),
+            v2.Normalize(mean=[0.5], std=[0.5])
         ])
+        # Legacy augmentations
+        # return transforms.Compose([
+        #     transforms.Resize((size, size)),
+        #     transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
+        #     transforms.RandomHorizontalFlip(),
+        #     transforms.RandomApply([
+        #         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+        #     ], p=0.8),
+        #     transforms.RandomGrayscale(p=0.2),
+        #     transforms.ToTensor(),
+        #     transforms.Normalize(MEDMNIST_MEAN, MEDMNIST_STD)
+        # ])
     else:
         # Standard transforms for linear probing/evaluation
         return transforms.Compose([
