@@ -1,67 +1,95 @@
 from typing import Tuple, Dict, Any, Optional
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
+import matplotlib.pyplot as plt
+import os
+
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-
 from torchvision.transforms import v2
 
-import os
-
-import matplotlib.pyplot as plt
-import torch
-
-# grayscale assumed
 MEDMNIST_MEAN = (0.5,)
 MEDMNIST_STD = (0.5,)
 
 
-def get_medmnist_transforms(size: int = 224, augment: bool = False) -> transforms.Compose:
-    if augment:
-        # SSL augmentations for SimCLR/VICReg pretraining
+def invert(img):
+    return ImageOps.invert(img)
+
+
+def get_medmnist_transforms(size: int = 224, augment: str | None = None) -> transforms.Compose:
+    # SSL augmentations for SimCLR/VICReg pretraining
+    assert augment is None or augment in ["ssl", "sft", "ref"]
+    if augment == "ssl":
         return transforms.Compose([
-            transforms.Resize((size, size)),
-            transforms.ToTensor(),
-            transforms.Normalize(MEDMNIST_MEAN, MEDMNIST_STD),
-
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-
             v2.RandomResizedCrop(
                 size=(224, 224),
                 scale=(0.5, 1.0),
-                ratio=(0.8, 1.2),
+                ratio=(0.75, 1.25),
                 antialias=True
             ),
             v2.RandomHorizontalFlip(p=0.5),  # for Pretraining OK
             v2.RandomAffine(
-                degrees=12,
+                degrees=15,
                 translate=(0.1, 0.1),
-                scale=(0.95, 1.05)
+                scale=(0.9, 1.1)
             ),
-
+            transforms.ToTensor(),
             v2.RandomApply([
                 v2.GaussianNoise(mean=0.0, sigma=0.05)
-            ], p=0.2),
-
-            v2.Lambda(lambda x: x.clamp(0.0, 1.0)),
-            v2.Normalize(mean=[0.5], std=[0.5])
+            ], p=0.8),
+            transforms.Normalize(mean=[0.5], std=[0.5])
         ])
-        # Legacy augmentations
-        # return transforms.Compose([
-        #     transforms.Resize((size, size)),
-        #     transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
-        #     transforms.RandomHorizontalFlip(),
-        #     transforms.RandomApply([
-        #         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-        #     ], p=0.8),
-        #     transforms.RandomGrayscale(p=0.2),
-        #     transforms.ToTensor(),
-        #     transforms.Normalize(MEDMNIST_MEAN, MEDMNIST_STD)
-        # ])
+# Legacy augmentations
+# return transforms.Compose([
+#     transforms.Resize((size, size)),
+#     transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
+#     transforms.RandomHorizontalFlip(),
+#     transforms.RandomApply([
+#         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+#     ], p=0.8),
+#     transforms.RandomGrayscale(p=0.2),
+#     transforms.ToTensor(),
+#     transforms.Normalize(MEDMNIST_MEAN, MEDMNIST_STD)
+# ])
+    elif augment == "sft":
+        return transforms.Compose([
+            v2.RandomResizedCrop(
+                size=(224, 224),
+                scale=(0.5, 1.0),
+                ratio=(0.9, 1.1),
+                antialias=True
+            ),
+            # v2.RandomHorizontalFlip(p=0.5),  # for Pretraining OK
+            v2.RandomAffine(
+                degrees=10,
+                translate=(0.1, 0.1),
+                scale=(0.9, 1.1)
+            ),
+            transforms.ToTensor(),
+            v2.RandomApply([
+                v2.GaussianNoise(mean=0.0, sigma=0.05)
+            ], p=0.5),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+    elif augment == "ref":
+        # I asked Gemini 3 to rewrite transforms from task 3
+        return transforms.Compose([
+            transforms.RandomApply([
+                transforms.RandomRotation(degrees=(-10.0, 10.0), interpolation=transforms.InterpolationMode.NEAREST, expand=False, fill=0)
+            ], p=0.5), # Assuming p=0.5 for RandomApply if not specified, usually wrapper for optionality
+            transforms.RandomResizedCrop(size=(size, size), scale=(0.5, 1.0), ratio=(0.75, 1.3333), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+            transforms.RandomApply([
+                transforms.ColorJitter(brightness=(0.8, 1.2), contrast=(0.8, 1.2))
+            ], p=0.5),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([
+                transforms.Lambda(invert)
+            ], p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
     else:
-        # Standard transforms for linear probing/evaluation
         return transforms.Compose([
             transforms.Resize((size, size)),
             transforms.ToTensor(),
@@ -109,49 +137,9 @@ class CustomNPZDataset(Dataset):
         return img, target
 
 
-class SSLDataset(Dataset):
-    """
-    returns two augmented views of the same image
-    """
-
-    def __init__(self, base_dataset, transform):
-        self.base_dataset = base_dataset
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx) -> Dict[str, Any]:
-        # We access the underlying dataset's __getitem__ without transform
-        # by accessing the internal data directly to avoid double transform
-
-        assert isinstance(self.base_dataset, CustomNPZDataset)
-        # manually get PIL image to apply different transforms
-        img_array = self.base_dataset.images[idx]
-        label = self.base_dataset.labels[idx]
-
-        assert img_array.ndim == 2
-        image = Image.fromarray(img_array, mode='L')
-
-        # flatten label if needed
-        label = torch.tensor(label, dtype=torch.long)
-        if label.ndim > 0 and label.shape[0] == 1:
-            label = label.squeeze()
-        assert label.ndim == 0
-
-        view1 = self.transform(image)
-        view2 = self.transform(image)
-
-        return {
-            "view1": view1,
-            "view2": view2,
-            "labels": label
-        }
-
-
+# At first I wanted to use HF-like training pipeline like in first HW but decided against it
+# I will just leave this here for reference as legacy code
 class HFDataset(Dataset):
-    """Dataset wrapper to make datasets compatible with HF Trainer"""
-
     def __init__(self, dataset, for_ssl: bool = False):
         self.dataset = dataset
         self.for_ssl = for_ssl
@@ -160,19 +148,27 @@ class HFDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx) -> Dict[str, Any]:
-        if self.for_ssl:
-            assert isinstance(self.dataset[idx], dict)
-            return self.dataset[idx]
-        else:
-            image, label = self.dataset[idx]
-            return {"pixel_values": image, "labels": label}
+        assert isinstance(self.dataset[idx], tuple)
+        image, label = self.dataset[idx]
+        return {"pixel_values": image, "labels": label}
 
 
-def plot_ssl_views(item):
-    view1 = item['view1']
-    view2 = item['view2']
-    label = item['labels']
+class SSLDataset:
+    def __init__(self, base_dataset, transform):
+        self.base_dataset = base_dataset
+        self.transform = transform
 
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        img, label = self.base_dataset[idx]
+        view1 = self.transform(img)
+        view2 = self.transform(img)
+        return view1, view2, label
+
+
+def plot_ssl_views(view1, view2, label):
     mean, std = 0.5, 0.5
     view1 = view1 * std + mean
     view2 = view2 * std + mean
@@ -235,6 +231,7 @@ def plot_views(item):
 
 
 if __name__ == "__main__":
+    # This probably doesn't work because I created this in the beggining back when I had different APIs
     data_path = '../data/pneumoniamnist_224.npz'
     size = 224
     # For SSL
@@ -246,30 +243,23 @@ if __name__ == "__main__":
     test_base = CustomNPZDataset(data_path, split='test', transform=None)
 
     # Wrap with SSL dataset
-    transform = get_medmnist_transforms(size=size, augment=True)
+    transform = get_medmnist_transforms(size=size, augment="ssl")
 
     train_set = SSLDataset(train_base, transform)
     val_set = SSLDataset(val_base, transform)  # Usually SSL is only trained on train_set
     test_set = SSLDataset(test_base, transform)
 
-    train_set = HFDataset(train_set, for_ssl=True)
-    val_set = HFDataset(val_set, for_ssl=True)
-    test_set = HFDataset(test_set, for_ssl=True)
-
     print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
-    print(train_set[0].keys())
+    print(train_set[0])
 
     # For SFT
     print("\n\nSFT:")
-    transform = get_medmnist_transforms(size=size, augment=False)
+    transform = get_medmnist_transforms(size=size, augment="sft")
 
-    train_base = CustomNPZDataset(data_path, split='train', transform=transform)
-    val_base = CustomNPZDataset(data_path, split='val', transform=transform)
-    test_base = CustomNPZDataset(data_path, split='test', transform=transform)
-
-    train_set = HFDataset(train_base, for_ssl=False)
-    val_set = HFDataset(val_base, for_ssl=False)
-    test_set = HFDataset(test_base, for_ssl=False)
+    train_set = CustomNPZDataset(data_path, split='train', transform=transform)
+    val_set = CustomNPZDataset(data_path, split='val', transform=transform)
+    test_set = CustomNPZDataset(data_path, split='test', transform=transform)
 
     print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
-    print(train_set[0].keys())
+    print(train_set[0])
+
