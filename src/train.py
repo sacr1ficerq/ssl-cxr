@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import math
 
-from .model import SimCLR, VICReg
+from .model import SimCLR, VICReg, SSLModelWithProbe
 
 device = 'cuda'
 
@@ -169,6 +169,155 @@ def linear_probe(encoder, train_loader, test_loader, epochs=100):
                     correct += (predicted == labels).sum().item()
             accuracy = 100 * correct / total
             print(f"Epoch {epoch+1}, Accuracy: {accuracy:.2f}%")
+
+
+def pretrain_ssl_with_online_probe(model, train_loader, val_loader, num_classes,
+                                   epochs=50, lr=0.3, device='cuda'):
+    ssl_model = model.to(device)
+    probe_model = SSLModelWithProbe(ssl_model, num_classes).to(device)
+
+    ssl_params = list(ssl_model.encoder.parameters()) + list(ssl_model.projection_head.parameters())
+    optimizer = LARS(ssl_params, lr=lr, momentum=0.9, weight_decay=1e-6)
+    probe_optimizer = optim.Adam(probe_model.linear_probe.parameters(), lr=1e-3)
+
+    scheduler = LinearWarmupCosineAnnealing(optimizer, warmup_epochs=10, max_epochs=epochs)
+    cls_criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        ssl_model.train()
+        probe_model.linear_probe.train()
+
+        total_ssl_loss = 0
+        total_cls_loss = 0
+        correct = 0
+        total = 0
+
+        for batch in train_loader:
+            view1 = batch['view1'].to(device)
+            view2 = batch['view2'].to(device)
+            labels = batch['labels'].to(device)
+
+            optimizer.zero_grad()
+            probe_optimizer.zero_grad()
+
+            ssl_loss = ssl_model(view1, view2)
+            ssl_loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                h1 = ssl_model.encoder(view1)
+
+            logits = probe_model.linear_probe(h1.detach())
+            cls_loss = cls_criterion(logits, labels)
+            cls_loss.backward()
+            probe_optimizer.step()
+
+            total_ssl_loss += ssl_loss.item()
+            total_cls_loss += cls_loss.item()
+
+            _, predicted = torch.max(logits, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+        scheduler.step(epoch)
+
+        train_acc = 100 * correct / total
+        print(f"Epoch {epoch+1}/{epochs} | SSL Loss: {total_ssl_loss/len(train_loader):.4f} | "
+              f"Probe Loss: {total_cls_loss/len(train_loader):.4f} | Probe Acc: {train_acc:.2f}%")
+
+        if (epoch + 1) % 5 == 0:
+            val_acc = evaluate_probe(ssl_model.encoder, probe_model.linear_probe, val_loader, device)
+            print(f"Val Accuracy: {val_acc:.2f}%")
+
+    return ssl_model
+
+def evaluate_probe(encoder, probe, loader, device):
+    encoder.eval()
+    probe.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            if isinstance(batch, dict):
+                images = batch['view1'].to(device)
+                labels = batch['labels'].to(device)
+            else:
+                images, labels = batch
+                images, labels = images.to(device), labels.to(device)
+
+            features = encoder(images)
+            logits = probe(features)
+            _, predicted = torch.max(logits, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    return 100 * correct / total
+
+
+def offline_linear_probe(encoder, train_loader, test_loader, num_classes, epochs=100, device='cuda'):
+    classifier = nn.Linear(512, num_classes).to(device)
+    optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    encoder.eval()
+    for param in encoder.parameters():
+        param.requires_grad = False
+
+    for epoch in range(epochs):
+        classifier.train()
+        total_loss = 0
+
+        for batch in train_loader:
+            if isinstance(batch, dict):
+                imgs = batch['pixel_values'].to(device)
+                labels = batch['labels'].to(device)
+            else:
+                imgs, labels = batch
+                imgs, labels = imgs.to(device), labels.to(device)
+
+            with torch.no_grad():
+                features = encoder(imgs)
+
+            logits = classifier(features)
+            loss = criterion(logits, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        if (epoch + 1) % 10 == 0:
+            acc = evaluate_classifier(encoder, classifier, test_loader, device)
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Acc: {acc:.2f}%")
+
+    final_acc = evaluate_classifier(encoder, classifier, test_loader, device)
+    return final_acc
+
+
+def evaluate_classifier(encoder, classifier, loader, device):
+    encoder.eval()
+    classifier.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            if isinstance(batch, dict):
+                imgs = batch['pixel_values'].to(device)
+                labels = batch['labels'].to(device)
+            else:
+                imgs, labels = batch
+                imgs, labels = imgs.to(device), labels.to(device)
+
+            features = encoder(imgs)
+            logits = classifier(features)
+            _, predicted = torch.max(logits, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    return 100 * correct / total
 
 
 if __name__ == '__main__':
